@@ -53,6 +53,13 @@ if [ "$ACTION" = "2" ]; then
 
   # 停止进程
   pkill -f "node.*index.js" || true
+  pkill -f "nodejs-argo" || true
+
+  # 卸载 npm 全局包
+  if npm list -g nodejs-argo >/dev/null 2>&1; then
+    log "卸载 npm 全局包 nodejs-argo"
+    npm uninstall -g nodejs-argo
+  fi
 
   # 移除安装目录
   if [ -d "/opt/nodejs-argo" ]; then
@@ -68,6 +75,11 @@ if [ "$ACTION" = "2" ]; then
   # 移除自启动脚本
   if [ -f "/etc/local.d/nodejs-argo.start" ]; then
     rm -f /etc/local.d/nodejs-argo.start
+  fi
+
+  # 移除日志目录
+  if [ -d "/var/log/nodejs-argo" ]; then
+    rm -rf /var/log/nodejs-argo
   fi
 
   log "卸载完成"
@@ -165,7 +177,6 @@ apk update
 apk add --no-cache \
   curl \
   ca-certificates \
-  git \
   jq \
   screen \
   tmux \
@@ -180,20 +191,20 @@ apk add --no-cache \
 rc-update add dcron default || true
 rc-update add local default || true
 
-# ===== 4) 获取资源 =====
-if [ ! -d nodejs-argo ]; then
-  log "克隆 nodejs-argo 仓库..."
-  git clone https://github.com/cokear/nodejs.git nodejs-argo
-fi
-cd nodejs-argo
+# ===== 4) 安装 nodejs-argo (使用 npm 全局安装) =====
+log "从 npm 全局安装 nodejs-argo..."
+npm install -g nodejs-argo
 
-# ===== 5) 安装依赖 =====
-if [ -f package.json ]; then
-  log "安装 npm 依赖..."
-  npm install --production
+# 验证安装
+if ! command -v nodejs-argo >/dev/null 2>&1; then
+  log "❌ 安装失败：找不到 nodejs-argo 命令"
+  log "请检查 npm 包名是否正确"
+  exit 1
 fi
 
-# ===== 6) 构建环境变量 =====
+log "✅ nodejs-argo 已成功安装到: $(which nodejs-argo)"
+
+# ===== 5) 构建环境变量 =====
 ENV_VARS="PORT=${PORT} ARGO_PORT=${ARGO_PORT} UUID=${UUID}"
 
 # 固定隧道
@@ -220,9 +231,9 @@ ENV_VARS="$ENV_VARS UPLOAD_URL='${UPLOAD_URL:-}' PROJECT_URL=${PROJECT_URL}"
 
 log "环境变量: $ENV_VARS"
 
-START_CMD="node index.js"
+START_CMD="nodejs-argo"
 
-# ===== 7) 后台运行方式 =====
+# ===== 6) 后台运行方式 =====
 printf "后台运行方式：1) screen+cron 2) tmux+cron 3) pm2 4) openrc（默认 4）: "
 read -r RUNNER
 RUNNER=${RUNNER:-4}
@@ -235,7 +246,7 @@ case "$RUNNER" in
     START_SCRIPT="$WORKDIR/start_nodejs_argo.sh"
     cat > "$START_SCRIPT" <<EOF
 #!/bin/sh
-cd $PWD
+cd $WORKDIR
 export $ENV_VARS
 screen -dmS nodejs-argo sh -c "$START_CMD"
 EOF
@@ -257,7 +268,7 @@ EOF
     START_SCRIPT="$WORKDIR/start_nodejs_argo.sh"
     cat > "$START_SCRIPT" <<EOF
 #!/bin/sh
-cd $PWD
+cd $WORKDIR
 export $ENV_VARS
 tmux new-session -d -s nodejs-argo "$START_CMD"
 EOF
@@ -279,12 +290,12 @@ EOF
     fi
     
     # 创建 ecosystem 配置文件
-    cat > "$PWD/ecosystem.config.js" <<EOF
+    cat > "$WORKDIR/ecosystem.config.js" <<EOF
 module.exports = {
   apps: [{
     name: 'nodejs-argo',
-    script: 'index.js',
-    cwd: '$PWD',
+    script: '$(which nodejs-argo)',
+    cwd: '$WORKDIR',
     env: {
 $(echo "$ENV_VARS" | tr ' ' '\n' | sed "s/^/      /;s/=/: '/;s/$/',/")
     },
@@ -297,6 +308,7 @@ $(echo "$ENV_VARS" | tr ' ' '\n' | sed "s/^/      /;s/=/: '/;s/$/',/")
 EOF
     
     # PM2 启动
+    cd "$WORKDIR"
     pm2 start ecosystem.config.js
     pm2 save
     
@@ -319,11 +331,10 @@ EOF
 name="nodejs-argo"
 description="NodeJS Argo Service"
 
-command="/usr/bin/node"
-command_args="$PWD/index.js"
+command="$(which nodejs-argo)"
 command_background="yes"
 pidfile="/run/\${RC_SVCNAME}.pid"
-directory="$PWD"
+directory="$WORKDIR"
 output_log="/var/log/nodejs-argo/output.log"
 error_log="/var/log/nodejs-argo/error.log"
 
@@ -335,6 +346,7 @@ depend() {
 start_pre() {
     # 创建日志目录
     mkdir -p /var/log/nodejs-argo
+    mkdir -p $WORKDIR
     
     # 设置环境变量
 $ENV_EXPORTS
@@ -348,8 +360,7 @@ start() {
         --pidfile "\${pidfile}" \\
         --stdout "\${output_log}" \\
         --stderr "\${error_log}" \\
-        --exec "\${command}" \\
-        -- \${command_args}
+        --exec "\${command}"
     eend \$?
 }
 
@@ -384,12 +395,12 @@ esac
 log "初始启动完成，等待服务启动..."
 sleep 5
 
-# ===== 8) 查找并显示日志 =====
+# ===== 7) 查找并显示日志 =====
 log "查找日志文件..."
 FOUND_LOGS=""
 
 # 常见日志位置
-for pattern in "$PWD/logs/*.log" "$PWD/*.log" "$PWD/tmp/*.log" "/var/log/nodejs-argo/*.log" "$HOME/.pm2/logs/*nodejs-argo*.log"; do
+for pattern in "$WORKDIR/logs/*.log" "$WORKDIR/*.log" "$WORKDIR/tmp/*.log" "/var/log/nodejs-argo/*.log" "$HOME/.pm2/logs/*nodejs-argo*.log"; do
   for logfile in $pattern; do
     if [ -f "$logfile" ]; then
       FOUND_LOGS="$FOUND_LOGS\n  $logfile"
@@ -412,16 +423,16 @@ else
   log "未找到日志文件，可能输出到 console"
 fi
 
-# ===== 9) 检查进程状态 =====
+# ===== 8) 检查进程状态 =====
 sleep 2
 echo ""
 echo "===== 进程状态检查 ====="
-if pgrep -f "node.*index.js" >/dev/null; then
-  PROCESS_INFO=$(ps aux | grep "node.*index.js" | grep -v grep)
-  log "✅ Node.js 进程运行中:"
+if pgrep -f "nodejs-argo" >/dev/null; then
+  PROCESS_INFO=$(ps aux | grep "nodejs-argo" | grep -v grep)
+  log "✅ nodejs-argo 进程运行中:"
   echo "$PROCESS_INFO"
 else
-  log "⚠️  未检测到运行中的 node 进程"
+  log "⚠️  未检测到运行中的 nodejs-argo 进程"
 fi
 
 # 检查哪吒进程
@@ -435,14 +446,15 @@ if [ -n "$NEZHA_SERVER" ]; then
   else
     log "⚠️  未检测到哪吒 Agent 进程"
     log "请检查 tmp 目录中的哪吒二进制文件:"
-    ls -lh "$PWD/tmp/" | grep -E "^[a-z]{6}$" || echo "未找到"
+    ls -lh "$WORKDIR/tmp/" 2>/dev/null | grep -E "^[a-z]{6}$" || echo "未找到"
   fi
 fi
 
-# ===== 10) 输出节点信息快照 =====
+# ===== 9) 输出节点信息快照 =====
 echo ""
 echo "===== 节点信息快照 ====="
-echo "工作目录: $PWD"
+echo "工作目录: $WORKDIR"
+echo "nodejs-argo 路径: $(which nodejs-argo)"
 echo "PORT: $PORT"
 echo "ARGO_PORT: $ARGO_PORT"
 echo "UUID: $UUID"
@@ -458,7 +470,7 @@ echo "UPLOAD_URL: ${UPLOAD_URL}"
 echo "后台运行: $(case "$RUNNER" in 1)echo "Screen+Cron";;2)echo "Tmux+Cron";;3)echo "PM2";;4)echo "OpenRC";; esac)"
 echo ""
 
-# ===== 11) 健康检查 =====
+# ===== 10) 健康检查 =====
 echo "===== 健康检查 ====="
 sleep 3
 
@@ -485,13 +497,13 @@ if command -v curl >/dev/null 2>&1; then
   fi
 fi
 
-# ===== 12) 订阅信息 =====
+# ===== 11) 订阅信息 =====
 echo ""
 echo "===== 订阅信息 ====="
 # 等待订阅文件生成
 sleep 5
 
-SUB_FILE="$PWD/tmp/sub.txt"
+SUB_FILE="$WORKDIR/tmp/sub.txt"
 if [ -f "$SUB_FILE" ]; then
   echo "📄 订阅文件位置: $SUB_FILE"
   echo "📋 订阅内容 (Base64):"
@@ -502,10 +514,10 @@ if [ -f "$SUB_FILE" ]; then
 else
   echo "⚠️  未找到 sub.txt 订阅文件"
   echo "🔍 查找所有 txt 文件:"
-  find "$PWD" -name "*.txt" -type f 2>/dev/null | head -10 || echo "未找到任何 txt 文件"
+  find "$WORKDIR" -name "*.txt" -type f 2>/dev/null | head -10 || echo "未找到任何 txt 文件"
 fi
 
-# ===== 13) 自启动验证 =====
+# ===== 12) 自启动验证 =====
 echo ""
 echo "===== 自启动配置验证 ====="
 case "$RUNNER" in
@@ -548,7 +560,7 @@ case "$RUNNER" in
     echo "查看状态: pm2 status"
     echo "停止服务: pm2 stop nodejs-argo"
     echo "重启服务: pm2 restart nodejs-argo"
-    echo "查看配置: cat $PWD/ecosystem.config.js"
+    echo "查看配置: cat $WORKDIR/ecosystem.config.js"
     ;;
   4)
     echo "查看状态: rc-service nodejs-argo status"
@@ -563,17 +575,18 @@ esac
 
 echo ""
 echo "===== 故障排查命令 ====="
-echo "查看进程: ps aux | grep node"
+echo "查看进程: ps aux | grep nodejs-argo"
 echo "查看端口: netstat -tuln | grep -E '$PORT|$ARGO_PORT'"
 echo "查看哪吒进程: ps aux | grep -E 'nezha|agent'"
-echo "查看 tmp 目录: ls -lh $PWD/tmp/"
+echo "查看 tmp 目录: ls -lh $WORKDIR/tmp/"
 echo "手动测试 HTTP: curl -I http://localhost:$PORT"
+echo "手动运行测试: cd $WORKDIR && export $ENV_VARS && nodejs-argo"
 
 echo ""
 echo "===== 测试重启后自启动 ====="
 echo "1. 重启系统: reboot"
 echo "2. 重启后等待 15 秒"
-echo "3. 验证服务: ps aux | grep node"
+echo "3. 验证服务: ps aux | grep nodejs-argo"
 echo "4. 验证端口: netstat -tuln | grep $PORT"
 
 echo ""
